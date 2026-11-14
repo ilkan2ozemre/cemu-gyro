@@ -1,0 +1,828 @@
+From fef7ff0d0e467f51a48e6d0944da8c835915d970 Mon Sep 17 00:00:00 2001
+From: cemu-gyro <cemu-gyro@localhost>
+Date: Sat, 14 Nov 2026 20:00:31 +0000
+Subject: [PATCH] input: use the built-in Windows IMU as motion source for SDL
+ gamepads without sensors
+
+Handhelds like the MSI Claw 8 AI+ expose their gamepad as an XInput device
+without motion sensors, while the IMU is a separate Windows sensor
+("Physical Gyrometer"/"Physical Accelerometer") that reports through the
+custom sensor value fields. SDL can't read those, so the motion option was
+greyed out. Poll them with the Windows Sensor API and feed them through the
+same integration path as SDL gamepad sensors.
+---
+ src/input/CMakeLists.txt                    |   6 +
+ src/input/api/SDL/SDLController.cpp         |  11 +
+ src/input/api/SDL/SDLController.h           |   3 +-
+ src/input/api/SDL/SDLControllerProvider.cpp | 164 +++++---
+ src/input/api/SDL/SDLControllerProvider.h   |  10 +
+ src/input/api/SDL/SystemIMU.cpp             | 441 ++++++++++++++++++++
+ src/input/api/SDL/SystemIMU.h               |  25 ++
+ 7 files changed, 596 insertions(+), 64 deletions(-)
+ create mode 100644 src/input/api/SDL/SystemIMU.cpp
+ create mode 100644 src/input/api/SDL/SystemIMU.h
+
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index 9f7dcff..66f55cf 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -95,6 +95,12 @@ if(ENABLE_SDL)
+ 		api/SDL/SDLControllerProvider.h
+ 	)
+ 	target_link_libraries(CemuInput PRIVATE	SDL3::SDL3)
++	if (WIN32)
++		target_sources(CemuInput PRIVATE
++			api/SDL/SystemIMU.cpp
++			api/SDL/SystemIMU.h
++		)
++	endif()
+ endif()
+ 
+ target_include_directories(CemuInput PUBLIC "../")
+diff --git a/src/input/api/SDL/SDLController.cpp b/src/input/api/SDL/SDLController.cpp
+index 77b0417..3c8fbdf 100644
+--- a/src/input/api/SDL/SDLController.cpp
++++ b/src/input/api/SDL/SDLController.cpp
+@@ -52,6 +52,9 @@ bool SDLController::connect()
+ 		return true;
+ 
+ 	m_has_rumble = false;
++	m_has_gyro = false;
++	m_has_accel = false;
++	m_use_system_imu = false;
+ 	const auto index = m_provider->get_index(m_guid_index, m_guid);
+ 	std::scoped_lock lock(m_controller_mutex);
+ 
+@@ -85,6 +88,10 @@ bool SDLController::connect()
+ 	if (SDL_GamepadHasSensor(m_controller, SDL_SENSOR_GYRO))
+ 		m_has_gyro = SDL_SetGamepadSensorEnabled(m_controller, SDL_SENSOR_GYRO, true);
+ 	m_has_rumble = SDL_RumbleGamepad(m_controller, 0, 0, 0);
++	// handheld gamepads like the MSI Claw's are plain XInput devices, the gyro lives in the device itself
++	m_use_system_imu = !(m_has_gyro && m_has_accel) && SDLControllerProvider::system_imu_available();
++	if (m_use_system_imu)
++		cemuLog_log(LogType::Force, "SDL: \"{}\" has no motion sensors, using the built-in system IMU", m_display_name);
+ 	return true;
+ }
+ 
+@@ -109,7 +116,11 @@ void SDLController::stop_rumble()
+ MotionSample SDLController::get_motion_sample()
+ {
+ 	if (is_connected() && has_motion())
++	{
++		if (m_use_system_imu)
++			return m_provider->system_imu_motion_sample();
+ 		return m_provider->motion_sample(m_diid);
++	}
+ 	return {};
+ }
+ 
+diff --git a/src/input/api/SDL/SDLController.h b/src/input/api/SDL/SDLController.h
+index 1a4dd8d..cd56936 100644
+--- a/src/input/api/SDL/SDLController.h
++++ b/src/input/api/SDL/SDLController.h
+@@ -23,7 +23,7 @@ public:
+ 	bool is_connected() override;
+ 	bool connect() override;
+ 	
+-	bool has_motion() override { return m_has_gyro && m_has_accel; }
++	bool has_motion() override { return (m_has_gyro && m_has_accel) || m_use_system_imu; }
+ 	bool has_rumble() override { return m_has_rumble; }
+ 	
+ 	void start_rumble() override;
+@@ -53,6 +53,7 @@ private:
+ 	bool m_has_gyro = false;
+ 	bool m_has_accel = false;
+ 	bool m_has_rumble = false;
++	bool m_use_system_imu = false; // gamepad has no motion sensors, use the host device's built-in IMU
+ 	
+ 	std::array<bool, SDL_GAMEPAD_BUTTON_COUNT> m_buttons{};
+ 	std::array<bool, SDL_GAMEPAD_AXIS_COUNT> m_axis{};
+diff --git a/src/input/api/SDL/SDLControllerProvider.cpp b/src/input/api/SDL/SDLControllerProvider.cpp
+index e678787..9952fa4 100644
+--- a/src/input/api/SDL/SDLControllerProvider.cpp
++++ b/src/input/api/SDL/SDLControllerProvider.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include "input/api/SDL/SDLController.h"
+ #include "util/helpers/TempState.h"
++#if BOOST_OS_WINDOWS
++#include "input/api/SDL/SystemIMU.h"
++#endif
+ 
+ #include <SDL3/SDL.h>
+ 
+@@ -116,8 +119,34 @@ MotionSample SDLControllerProvider::motion_sample(SDL_JoystickID diid)
+ 	return (it != s_motion_states.end()) ? it->second.data : MotionSample{};
+ }
+ 
++bool SDLControllerProvider::system_imu_available()
++{
++#if BOOST_OS_WINDOWS
++	return SystemIMU::IsAvailable();
++#else
++	return false;
++#endif
++}
++
++MotionSample SDLControllerProvider::system_imu_motion_sample()
++{
++	std::shared_lock lock(s_mutex);
++	return s_system_imu_state.data;
++}
++
++void SDLControllerProvider::OnSystemIMUSample(uint64_t timestampNs, const float gyro[3], const float accel[3])
++{
++	std::scoped_lock _l(s_mutex);
++	ProcessSensorSample(s_system_imu_state, SDL_SENSOR_ACCEL, timestampNs, accel);
++	ProcessSensorSample(s_system_imu_state, SDL_SENSOR_GYRO, timestampNs, gyro);
++}
++
+ void SDLControllerProvider::InitSDL()
+ {
++#if BOOST_OS_WINDOWS
++	// probe before SDL reports any gamepads, so SDLController::connect() sees the result
++	SystemIMU::Start(&SDLControllerProvider::OnSystemIMUSample);
++#endif
+ 	SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+ 	SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
+ 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4, "1");
+@@ -132,6 +161,9 @@ void SDLControllerProvider::InitSDL()
+ 
+ 	if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC))
+ 	{
++#if BOOST_OS_WINDOWS
++		SystemIMU::Stop();
++#endif
+ 		throw std::runtime_error(fmt::format("couldn't initialize SDL: {}", SDL_GetError()));
+ 	}
+ 
+@@ -144,6 +176,9 @@ void SDLControllerProvider::InitSDL()
+ 
+ void SDLControllerProvider::ShutdownSDL()
+ {
++#if BOOST_OS_WINDOWS
++	SystemIMU::Stop();
++#endif
+ 	SDL_QuitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC);
+ }
+ 
+@@ -209,80 +244,83 @@ void SDLControllerProvider::HandleSDLEvent(SDL_Event& event)
+ 		}
+ 		case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:		/**< Game controller sensor was updated */
+ 		{
+-			SDL_JoystickID id = event.gsensor.which;
+-			uint64_t ts = event.gsensor.timestamp;
+ 			std::scoped_lock _l(s_mutex);
+-			auto& state = s_motion_states[id];
+-			auto& tracking = state.tracking;
+-
+-			if (event.gsensor.sensor == SDL_SENSOR_ACCEL)
+-			{
+-				const auto dif = ts - tracking.lastTimestampAccel;
+-				if (dif <= 0)
+-				{
+-					break;
+-				}
++			ProcessSensorSample(s_motion_states[event.gsensor.which], (SDL_SensorType)event.gsensor.sensor, event.gsensor.timestamp, event.gsensor.data);
++			break;
++		}
++	}
++}
+ 
+-				if (dif >= 10000000000)
+-				{
+-					tracking.hasAcc = false;
+-					tracking.hasGyro = false;
+-					tracking.lastTimestampAccel = ts;
+-					break;
+-				}
++// data is in SDL's sensor frame and units (accel in m/s^2, gyro in rad/s)
++void SDLControllerProvider::ProcessSensorSample(MotionState& state, SDL_SensorType sensor, uint64 ts, const float* data)
++{
++	auto& tracking = state.tracking;
+ 
+-				tracking.lastTimestampAccel = ts;
+-				tracking.acc[0] = -event.gsensor.data[0] / 9.81f;
+-				tracking.acc[1] = -event.gsensor.data[1] / 9.81f;
+-				tracking.acc[2] = -event.gsensor.data[2] / 9.81f;
+-				tracking.hasAcc = true;
+-			}
+-			if (event.gsensor.sensor == SDL_SENSOR_GYRO)
+-			{
+-				const auto dif = ts - tracking.lastTimestampGyro;
+-				if (dif <= 0)
+-				{
+-					break;
+-				}
++	if (sensor == SDL_SENSOR_ACCEL)
++	{
++		const auto dif = ts - tracking.lastTimestampAccel;
++		if (dif <= 0)
++		{
++			return;
++		}
+ 
+-				if (dif >= 10000000000)
+-				{
+-					tracking.hasAcc = false;
+-					tracking.hasGyro = false;
+-					tracking.lastTimestampGyro = ts;
+-					break;
+-				}
++		if (dif >= 10000000000)
++		{
++			tracking.hasAcc = false;
++			tracking.hasGyro = false;
++			tracking.lastTimestampAccel = ts;
++			return;
++		}
+ 
+-				tracking.lastTimestampGyro = ts;
+-				tracking.gyro[0] = event.gsensor.data[0];
+-				tracking.gyro[1] = -event.gsensor.data[1];
+-				tracking.gyro[2] = -event.gsensor.data[2];
+-				tracking.hasGyro = true;
+-			}
+-			if (tracking.hasAcc && tracking.hasGyro)
+-			{
+-				auto ts = std::max(tracking.lastTimestampGyro, tracking.lastTimestampAccel);
++		tracking.lastTimestampAccel = ts;
++		tracking.acc[0] = -data[0] / 9.81f;
++		tracking.acc[1] = -data[1] / 9.81f;
++		tracking.acc[2] = -data[2] / 9.81f;
++		tracking.hasAcc = true;
++	}
++	if (sensor == SDL_SENSOR_GYRO)
++	{
++		const auto dif = ts - tracking.lastTimestampGyro;
++		if (dif <= 0)
++		{
++			return;
++		}
+ 
+-				if (ts > tracking.lastTimestampIntegrate)
+-				{
+-					const auto tsDif = ts - tracking.lastTimestampIntegrate;
+-					tracking.lastTimestampIntegrate = ts;
+-					float tsDifD = (float)tsDif / 1000000000.0f;
++		if (dif >= 10000000000)
++		{
++			tracking.hasAcc = false;
++			tracking.hasGyro = false;
++			tracking.lastTimestampGyro = ts;
++			return;
++		}
+ 
+-					if (tsDifD >= 1.0f)
+-					{
+-						tsDifD = 1.0f;
+-					}
++		tracking.lastTimestampGyro = ts;
++		tracking.gyro[0] = data[0];
++		tracking.gyro[1] = -data[1];
++		tracking.gyro[2] = -data[2];
++		tracking.hasGyro = true;
++	}
++	if (tracking.hasAcc && tracking.hasGyro)
++	{
++		auto ts = std::max(tracking.lastTimestampGyro, tracking.lastTimestampAccel);
+ 
+-					state.handler.processMotionSample(tsDifD, tracking.gyro.x, tracking.gyro.y, tracking.gyro.z, tracking.acc.x, -tracking.acc.y, -tracking.acc.z);
+-					state.data = state.handler.getMotionSample();
+-				}
++		if (ts > tracking.lastTimestampIntegrate)
++		{
++			const auto tsDif = ts - tracking.lastTimestampIntegrate;
++			tracking.lastTimestampIntegrate = ts;
++			float tsDifD = (float)tsDif / 1000000000.0f;
+ 
+-				tracking.hasAcc = false;
+-				tracking.hasGyro = false;
++			if (tsDifD >= 1.0f)
++			{
++				tsDifD = 1.0f;
+ 			}
+-			break;
++
++			state.handler.processMotionSample(tsDifD, tracking.gyro.x, tracking.gyro.y, tracking.gyro.z, tracking.acc.x, -tracking.acc.y, -tracking.acc.z);
++			state.data = state.handler.getMotionSample();
+ 		}
++
++		tracking.hasAcc = false;
++		tracking.hasGyro = false;
+ 	}
+ }
+ 
+diff --git a/src/input/api/SDL/SDLControllerProvider.h b/src/input/api/SDL/SDLControllerProvider.h
+index e67eb06..b897dfd 100644
+--- a/src/input/api/SDL/SDLControllerProvider.h
++++ b/src/input/api/SDL/SDLControllerProvider.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <SDL3/SDL_joystick.h>
++#include <SDL3/SDL_sensor.h>
+ #include "input/motion/MotionHandler.h"
+ #include "input/api/ControllerProvider.h"
+ 
+@@ -24,6 +25,10 @@ public:
+ 
+ 	MotionSample motion_sample(SDL_JoystickID diid);
+ 
++	// built-in IMU of the host device (Windows handhelds), used for gamepads without their own motion sensors
++	static bool system_imu_available();
++	MotionSample system_imu_motion_sample();
++
+ 	// exposed for manual event handling on macOS
+ #if BOOST_OS_MACOS
+ 	static void InitSDL();
+@@ -66,4 +71,9 @@ private:
+ 	};
+ 
+ 	inline static std::unordered_map<SDL_JoystickID, MotionState> s_motion_states{};
++	// kept separate from s_motion_states, which is keyed by (and erased with) gamepad ids
++	inline static MotionState s_system_imu_state{};
++
++	static void ProcessSensorSample(MotionState& state, SDL_SensorType sensor, uint64 timestamp, const float* data);
++	static void OnSystemIMUSample(uint64_t timestampNs, const float gyro[3], const float accel[3]);
+ };
+diff --git a/src/input/api/SDL/SystemIMU.cpp b/src/input/api/SDL/SystemIMU.cpp
+new file mode 100644
+index 0000000..817e998
+--- /dev/null
++++ b/src/input/api/SDL/SystemIMU.cpp
+@@ -0,0 +1,441 @@
++#include "input/api/SDL/SystemIMU.h"
++#include "util/helpers/helpers.h"
++
++#include <windows.h>
++#include <initguid.h> // instantiate the SENSOR_* GUIDs and property keys from sensors.h
++#include <sensorsapi.h>
++#include <sensors.h>
++#include <PortableDeviceTypes.h>
++
++#include <cctype>
++#include <future>
++#include <optional>
++
++// Some handhelds (MSI Claw 8 AI+ / A2VM, Claw 8 EX AI+ / CG3EM) expose their IMU as
++// "Physical Gyrometer" / "Physical Accelerometer" sensors. They report data in the custom
++// sensor value fields instead of the standard ones, so SDL's Windows sensor backend can't
++// read them. Field IDs and axis mapping are taken from Handheld Companion's device
++// configs (Resources/Devices/ClawA2VM.json).
++static const PROPERTYKEY kCustomValueX = {{0xb14c764f, 0x07cf, 0x41e8, {0x9d, 0x82, 0xeb, 0xe3, 0xd0, 0x77, 0x6a, 0x6f}}, 7};
++static const PROPERTYKEY kCustomValueY = {{0xb14c764f, 0x07cf, 0x41e8, {0x9d, 0x82, 0xeb, 0xe3, 0xd0, 0x77, 0x6a, 0x6f}}, 8};
++static const PROPERTYKEY kCustomValueZ = {{0xb14c764f, 0x07cf, 0x41e8, {0x9d, 0x82, 0xeb, 0xe3, 0xd0, 0x77, 0x6a, 0x6f}}, 9};
++
++// raw -> SDL frame: SDL.x = raw.x, SDL.y = raw.z, SDL.z = -raw.y
++static constexpr const char* kDefaultAxes = "x,z,-y";
++
++// Cemu's SDL path divides by 9.81, use the same value so the conversion round-trips exactly
++static constexpr float kGravity = 9.81f;
++static constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
++
++namespace
++{
++	enum class SensorKind
++	{
++		Gyro,
++		Accel,
++	};
++
++	struct AxisMap
++	{
++		int index[3]{0, 1, 2};
++		float sign[3]{1.0f, 1.0f, 1.0f};
++	};
++
++	struct OpenSensor
++	{
++		ISensor* sensor = nullptr;
++		PROPERTYKEY fields[3]{};
++		bool customFields = false;
++		std::string name;
++
++		void Release()
++		{
++			if (sensor)
++				sensor->Release();
++			sensor = nullptr;
++		}
++	};
++
++	std::mutex s_lifecycleMutex;
++	std::thread s_thread;
++	std::atomic_bool s_running{false};
++	std::atomic_bool s_available{false};
++
++	std::string ToUTF8(const wchar_t* str)
++	{
++		if (!str)
++			return {};
++		const int length = WideCharToMultiByte(CP_UTF8, 0, str, -1, nullptr, 0, nullptr, nullptr);
++		if (length <= 1)
++			return {};
++		std::string result(length - 1, '\0');
++		WideCharToMultiByte(CP_UTF8, 0, str, -1, result.data(), length, nullptr, nullptr);
++		return result;
++	}
++
++	std::string ToLower(std::string str)
++	{
++		std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return (char)std::tolower(c); });
++		return str;
++	}
++
++	std::optional<std::string> GetEnv(const char* name)
++	{
++		char* value = nullptr;
++		size_t length = 0;
++		if (_dupenv_s(&value, &length, name) != 0 || !value)
++			return std::nullopt;
++		std::string result(value);
++		free(value);
++		return result;
++	}
++
++	// parses "x,z,-y" style mappings: output axis i = sign * raw[axis]
++	std::optional<AxisMap> ParseAxisMap(std::string_view text)
++	{
++		AxisMap map{};
++		bool used[3]{};
++		int axis = 0;
++		size_t pos = 0;
++		while (axis < 3)
++		{
++			while (pos < text.size() && text[pos] == ' ')
++				++pos;
++			float sign = 1.0f;
++			if (pos < text.size() && (text[pos] == '-' || text[pos] == '+'))
++			{
++				sign = text[pos] == '-' ? -1.0f : 1.0f;
++				++pos;
++			}
++			if (pos >= text.size())
++				return std::nullopt;
++			const char c = (char)std::tolower((unsigned char)text[pos++]);
++			if (c < 'x' || c > 'z' || used[c - 'x'])
++				return std::nullopt;
++			used[c - 'x'] = true;
++			map.index[axis] = c - 'x';
++			map.sign[axis] = sign;
++			++axis;
++			while (pos < text.size() && text[pos] == ' ')
++				++pos;
++			if (axis < 3)
++			{
++				if (pos >= text.size() || text[pos] != ',')
++					return std::nullopt;
++				++pos;
++			}
++		}
++		if (pos != text.size())
++			return std::nullopt;
++		return map;
++	}
++
++	AxisMap GetAxisMap(const char* specificVar)
++	{
++		for (const char* var : {specificVar, "CEMU_SYSTEM_IMU_AXES"})
++		{
++			if (auto value = GetEnv(var))
++			{
++				if (auto map = ParseAxisMap(*value))
++				{
++					cemuLog_log(LogType::Force, "SystemIMU: using {}={}", var, *value);
++					return *map;
++				}
++				cemuLog_log(LogType::Force, "SystemIMU: ignoring invalid {}={} (expected e.g. \"x,z,-y\")", var, *value);
++			}
++		}
++		return *ParseAxisMap(kDefaultAxes);
++	}
++
++	bool SupportsFields(ISensor* sensor, const PROPERTYKEY (&fields)[3])
++	{
++		for (const auto& field : fields)
++		{
++			VARIANT_BOOL supported = VARIANT_FALSE;
++			if (FAILED(sensor->SupportsDataField(field, &supported)) || supported == VARIANT_FALSE)
++				return false;
++		}
++		return true;
++	}
++
++	std::optional<SensorKind> GetKind(ISensor* sensor, const std::string& name)
++	{
++		SENSOR_TYPE_ID type{};
++		if (SUCCEEDED(sensor->GetType(&type)))
++		{
++			if (IsEqualGUID(type, SENSOR_TYPE_GYROMETER_3D))
++				return SensorKind::Gyro;
++			if (IsEqualGUID(type, SENSOR_TYPE_ACCELEROMETER_3D))
++				return SensorKind::Accel;
++		}
++		// custom sensors are only recognizable by their name
++		const std::string lowerName = ToLower(name);
++		if (lowerName.find("accelerometer") != std::string::npos)
++			return SensorKind::Accel;
++		if (lowerName.find("gyrometer") != std::string::npos || lowerName.find("gyroscope") != std::string::npos)
++			return SensorKind::Gyro;
++		return std::nullopt;
++	}
++
++	void SetReportInterval(ISensor* sensor, ULONG requestedMs)
++	{
++		ULONG intervalMs = requestedMs;
++		PROPVARIANT minInterval;
++		PropVariantInit(&minInterval);
++		if (SUCCEEDED(sensor->GetProperty(SENSOR_PROPERTY_MIN_REPORT_INTERVAL, &minInterval)) && minInterval.vt == VT_UI4)
++			intervalMs = std::max<ULONG>(intervalMs, minInterval.ulVal);
++		PropVariantClear(&minInterval);
++
++		IPortableDeviceValues* values = nullptr;
++		if (FAILED(CoCreateInstance(__uuidof(PortableDeviceValues), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&values))))
++			return;
++		values->SetUnsignedIntegerValue(SENSOR_PROPERTY_CURRENT_REPORT_INTERVAL, intervalMs);
++		IPortableDeviceValues* results = nullptr;
++		sensor->SetProperties(values, &results);
++		if (results)
++			results->Release();
++		values->Release();
++	}
++
++	// returns the first sensor of the requested kind, preferring ones with the custom fields
++	OpenSensor FindSensor(ISensorManager* manager, SensorKind kind)
++	{
++		OpenSensor best;
++		ISensorCollection* collection = nullptr;
++		if (FAILED(manager->GetSensorsByCategory(SENSOR_CATEGORY_ALL, &collection)) || !collection)
++			return best;
++
++		const PROPERTYKEY customFields[3] = {kCustomValueX, kCustomValueY, kCustomValueZ};
++		const PROPERTYKEY standardFields[3] = {
++			kind == SensorKind::Gyro ? SENSOR_DATA_TYPE_ANGULAR_VELOCITY_X_DEGREES_PER_SECOND : SENSOR_DATA_TYPE_ACCELERATION_X_G,
++			kind == SensorKind::Gyro ? SENSOR_DATA_TYPE_ANGULAR_VELOCITY_Y_DEGREES_PER_SECOND : SENSOR_DATA_TYPE_ACCELERATION_Y_G,
++			kind == SensorKind::Gyro ? SENSOR_DATA_TYPE_ANGULAR_VELOCITY_Z_DEGREES_PER_SECOND : SENSOR_DATA_TYPE_ACCELERATION_Z_G,
++		};
++
++		ULONG count = 0;
++		collection->GetCount(&count);
++		for (ULONG i = 0; i < count; ++i)
++		{
++			ISensor* sensor = nullptr;
++			if (FAILED(collection->GetAt(i, &sensor)) || !sensor)
++				continue;
++
++			BSTR friendlyName = nullptr;
++			std::string name = "Unknown Sensor";
++			if (SUCCEEDED(sensor->GetFriendlyName(&friendlyName)) && friendlyName)
++				name = ToUTF8(friendlyName);
++			if (friendlyName)
++				SysFreeString(friendlyName);
++
++			const auto sensorKind = GetKind(sensor, name);
++			if (sensorKind != kind)
++			{
++				sensor->Release();
++				continue;
++			}
++
++			OpenSensor candidate;
++			candidate.name = name;
++			if (SupportsFields(sensor, customFields))
++			{
++				std::copy(std::begin(customFields), std::end(customFields), candidate.fields);
++				candidate.customFields = true;
++			}
++			else if (SupportsFields(sensor, standardFields))
++			{
++				std::copy(std::begin(standardFields), std::end(standardFields), candidate.fields);
++			}
++			else
++			{
++				cemuLog_log(LogType::Force, "SystemIMU: skipping \"{}\", it has no known data fields", name);
++				sensor->Release();
++				continue;
++			}
++
++			candidate.sensor = sensor;
++			if (!best.sensor || (candidate.customFields && !best.customFields))
++			{
++				best.Release();
++				best = candidate;
++			}
++			else
++			{
++				candidate.Release();
++			}
++		}
++		collection->Release();
++		return best;
++	}
++
++	bool ReadValue(ISensorDataReport* report, const PROPERTYKEY& key, float& out)
++	{
++		PROPVARIANT value;
++		PropVariantInit(&value);
++		if (FAILED(report->GetSensorValue(key, &value)))
++			return false;
++		bool ok = true;
++		switch (value.vt)
++		{
++		case VT_R8: out = (float)value.dblVal; break;
++		case VT_R4: out = value.fltVal; break;
++		case VT_I4: out = (float)value.lVal; break;
++		case VT_UI4: out = (float)value.ulVal; break;
++		case VT_I2: out = (float)value.iVal; break;
++		case VT_UI2: out = (float)value.uiVal; break;
++		default: ok = false; break;
++		}
++		PropVariantClear(&value);
++		return ok;
++	}
++
++	bool ReadSensor(const OpenSensor& sensor, float (&out)[3], bool& errorLogged)
++	{
++		ISensorDataReport* report = nullptr;
++		const HRESULT hr = sensor.sensor->GetData(&report);
++		if (FAILED(hr) || !report)
++		{
++			if (!errorLogged)
++				cemuLog_log(LogType::Force, "SystemIMU: reading \"{}\" failed (HRESULT 0x{:08x})", sensor.name, (uint32_t)hr);
++			errorLogged = true;
++			return false;
++		}
++		const bool ok = ReadValue(report, sensor.fields[0], out[0]) &&
++						ReadValue(report, sensor.fields[1], out[1]) &&
++						ReadValue(report, sensor.fields[2], out[2]);
++		report->Release();
++		if (!ok && !errorLogged)
++			cemuLog_log(LogType::Force, "SystemIMU: \"{}\" returned a report without numeric x/y/z values", sensor.name);
++		errorLogged |= !ok;
++		return ok;
++	}
++
++	void Remap(const AxisMap& map, const float (&raw)[3], float (&out)[3], float scale)
++	{
++		for (int i = 0; i < 3; ++i)
++			out[i] = raw[map.index[i]] * map.sign[i] * scale;
++	}
++
++	void PollThread(SystemIMU::SampleCallback callback, std::promise<bool> probeResult)
++	{
++		SetThreadName("SystemIMU");
++		const HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++
++		ISensorManager* manager = nullptr;
++		OpenSensor gyro, accel;
++		if (SUCCEEDED(CoCreateInstance(__uuidof(SensorManager), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&manager))) && manager)
++		{
++			gyro = FindSensor(manager, SensorKind::Gyro);
++			accel = FindSensor(manager, SensorKind::Accel);
++		}
++		else
++		{
++			cemuLog_log(LogType::Force, "SystemIMU: Windows sensor manager unavailable");
++		}
++
++		const bool available = gyro.sensor && accel.sensor;
++		if (gyro.sensor)
++			cemuLog_log(LogType::Force, "SystemIMU: gyrometer \"{}\" ({} fields)", gyro.name, gyro.customFields ? "custom" : "standard");
++		if (accel.sensor)
++			cemuLog_log(LogType::Force, "SystemIMU: accelerometer \"{}\" ({} fields)", accel.name, accel.customFields ? "custom" : "standard");
++		if (!available)
++			cemuLog_log(LogType::Force, "SystemIMU: no built-in gyrometer + accelerometer pair found");
++
++		int rateHz = 250;
++		if (auto rate = GetEnv("CEMU_SYSTEM_IMU_RATE"))
++			rateHz = std::clamp(std::atoi(rate->c_str()), 30, 1000);
++		const auto period = std::chrono::nanoseconds(1'000'000'000 / rateHz);
++
++		AxisMap gyroMap{}, accelMap{};
++		if (available)
++		{
++			gyroMap = GetAxisMap("CEMU_SYSTEM_IMU_GYRO_AXES");
++			accelMap = GetAxisMap("CEMU_SYSTEM_IMU_ACCEL_AXES");
++			SetReportInterval(gyro.sensor, (ULONG)std::max(1, 1000 / rateHz));
++			SetReportInterval(accel.sensor, (ULONG)std::max(1, 1000 / rateHz));
++		}
++
++		s_available = available;
++		probeResult.set_value(available);
++
++		uint64_t sampleCount = 0;
++		bool gyroErrorLogged = false, accelErrorLogged = false;
++		auto nextPoll = std::chrono::steady_clock::now();
++		while (available && s_running.load(std::memory_order_relaxed))
++		{
++			float rawGyro[3], rawAccel[3];
++			if (ReadSensor(gyro, rawGyro, gyroErrorLogged) && ReadSensor(accel, rawAccel, accelErrorLogged))
++			{
++				// raw data is in deg/s and g, convert to SDL's rad/s and m/s^2
++				float sdlGyro[3], sdlAccel[3];
++				Remap(gyroMap, rawGyro, sdlGyro, kDegToRad);
++				Remap(accelMap, rawAccel, sdlAccel, kGravity);
++
++				const auto now = std::chrono::steady_clock::now();
++				const uint64_t ts = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
++				callback(ts, sdlGyro, sdlAccel);
++
++				// log a sample at startup and after a few seconds, to help with checking the axis mapping
++				if (sampleCount == 0 || sampleCount == (uint64_t)rateHz * 5)
++				{
++					cemuLog_log(LogType::Force, "SystemIMU: raw gyro (deg/s) {:.2f} {:.2f} {:.2f} | raw accel (g) {:.3f} {:.3f} {:.3f}",
++								rawGyro[0], rawGyro[1], rawGyro[2], rawAccel[0], rawAccel[1], rawAccel[2]);
++					cemuLog_log(LogType::Force, "SystemIMU: mapped accel (g) {:.3f} {:.3f} {:.3f} (lying flat, screen up, should be about 0 1 0)",
++								sdlAccel[0] / kGravity, sdlAccel[1] / kGravity, sdlAccel[2] / kGravity);
++				}
++				++sampleCount;
++			}
++
++			nextPoll += period;
++			const auto now = std::chrono::steady_clock::now();
++			if (nextPoll < now)
++				nextPoll = now;
++			std::this_thread::sleep_until(nextPoll);
++		}
++
++		gyro.Release();
++		accel.Release();
++		if (manager)
++			manager->Release();
++		if (SUCCEEDED(coInit))
++			CoUninitialize();
++	}
++}
++
++bool SystemIMU::Start(SampleCallback callback)
++{
++	std::scoped_lock lock(s_lifecycleMutex);
++	if (s_thread.joinable())
++		return s_available;
++
++	if (auto enabled = GetEnv("CEMU_SYSTEM_IMU"); enabled && *enabled == "0")
++	{
++		cemuLog_log(LogType::Force, "SystemIMU: disabled by CEMU_SYSTEM_IMU=0");
++		return false;
++	}
++
++	std::promise<bool> probeResult;
++	auto probeFuture = probeResult.get_future();
++	s_running = true;
++	s_thread = std::thread(PollThread, callback, std::move(probeResult));
++	const bool available = probeFuture.get();
++	if (!available)
++	{
++		s_running = false;
++		s_thread.join();
++	}
++	return available;
++}
++
++void SystemIMU::Stop()
++{
++	std::scoped_lock lock(s_lifecycleMutex);
++	s_running = false;
++	if (s_thread.joinable())
++		s_thread.join();
++	s_available = false;
++}
++
++bool SystemIMU::IsAvailable()
++{
++	return s_available;
++}
+diff --git a/src/input/api/SDL/SystemIMU.h b/src/input/api/SDL/SystemIMU.h
+new file mode 100644
+index 0000000..c1aee23
+--- /dev/null
++++ b/src/input/api/SDL/SystemIMU.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++// Built-in IMU of Windows handhelds (e.g. MSI Claw 8 AI+), read through the legacy
++// Windows Sensor API. Their gamepads are XInput devices without motion sensors, so SDL
++// reports no gyro for them. SDLController uses this as a fallback motion source.
++//
++// Samples are delivered in SDL's gamepad sensor frame and units (gyro in rad/s,
++// accelerometer in m/s^2) so they can share SDL's motion integration code.
++//
++// Environment overrides:
++//   CEMU_SYSTEM_IMU=0              disable the fallback
++//   CEMU_SYSTEM_IMU_AXES=x,z,-y    raw -> SDL axis mapping for both sensors
++//   CEMU_SYSTEM_IMU_GYRO_AXES=...  gyro-only mapping (overrides CEMU_SYSTEM_IMU_AXES)
++//   CEMU_SYSTEM_IMU_ACCEL_AXES=... accel-only mapping (overrides CEMU_SYSTEM_IMU_AXES)
++//   CEMU_SYSTEM_IMU_RATE=250       polling rate in Hz
++namespace SystemIMU
++{
++	using SampleCallback = void (*)(uint64_t timestampNs, const float gyro[3], const float accel[3]);
++
++	// Finds the sensors and starts polling them. Returns true if both a gyrometer and an
++	// accelerometer were found. Blocks until the sensor probe has finished.
++	bool Start(SampleCallback callback);
++	void Stop();
++	bool IsAvailable();
++}
+-- 
+2.54.0 (Apple Git-157)
+
